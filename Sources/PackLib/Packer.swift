@@ -159,19 +159,12 @@ public struct Packer: Sendable {
                     try await packFile(srcName: "\(package)_\(target).bundle")
                 case .binaryTarget(let name):
                     let src = URL(fileURLWithPath: "\(name).framework/\(name)", relativeTo: binDir)
-                    let magic = Data("!<arch>\n".utf8)
-                    let thinMagic = Data("!<thin>\n".utf8)
-                    guard let bytes = try? FileHandle(forReadingFrom: src).read(upToCount: magic.count) else {
-                        // if we can't find the binary, it might be a static framework that SwiftPM
-                        // did not copy into the .build directory. we don't need to pack it anyway.
-                        break
-                    }
-                    // if the magic matches one of these it's a static archive; don't embed it.
-                    // https://github.com/apple/llvm-project/blob/e716ff14c46490d2da6b240806c04e2beef01f40/llvm/include/llvm/Object/Archive.h#L33
-                    // swiftlint:disable:previous line_length
-                    if bytes != magic && bytes != thinMagic {
-                        try await packFile(srcName: "\(name).framework", dstName: "Frameworks/\(name).framework", sign: true)
-                    }
+                    // if we can't find the binary, it might be a static framework that SwiftPM
+                    // did not copy into the .build directory. we don't need to pack it anyway.
+                    // static archives (thin, or every slice of a fat file) are linked into the
+                    // executable already, and embedding them makes signing fail.
+                    guard let isStatic = Packer.isStaticArchive(at: src), !isStatic else { break }
+                    try await packFile(srcName: "\(name).framework", dstName: "Frameworks/\(name).framework", sign: true)
                 case .library(let name):
                     try await packFile(srcName: "lib\(name).dylib", dstName: "Frameworks/lib\(name).dylib", sign: true)
                 case .root(let source):
@@ -233,7 +226,7 @@ public struct Packer: Sendable {
 }
 
 extension Plan.Product {
-    fileprivate var linkerSettings: String {
+    var linkerSettings: String {
         switch self.type {
         case .application: """
         [
@@ -249,6 +242,12 @@ extension Plan.Product {
             .unsafeFlags([
                 // Set the entry point to Foundation`_NSExtensionMain
                 "-Xlinker", "-e", "-Xlinker", "_NSExtensionMain",
+                // With SwiftBuild, the extension's library reaches the linker as a static
+                // archive (the SDK's ld trampoline turns `ld -r` into `llvm-lib -static`), and
+                // nothing reachable from _NSExtensionMain references its code (the `main` that
+                // @main WidgetBundle emits, or an NSExtensionPrincipalClass). The linker would
+                // load no members and produce an empty binary, so load all of them.
+                "-Xlinker", "-all_load",
                 // Include frameworks that the host app may use
                 "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../Frameworks",
                 // ...as well as our own
